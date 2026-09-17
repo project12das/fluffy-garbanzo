@@ -1,108 +1,107 @@
-name: Windows RDP (Persistent)
+name: Windows Cloud RDP - Persistent VPS
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
 
 jobs:
-  rdp:
-    runs-on: windows-latest
-    timeout-minutes: 350
+  build:
+    # IMPORTANT:
+    # Use a real Windows VPS configured as a GitHub self-hosted runner.
+    # "windows-latest" is an ephemeral GitHub-hosted VM; its files are not
+    # guaranteed to survive after the workflow ends.
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 360
 
     steps:
-      # ═══════════ 1. RESTORE: برگردوندن فایل‌های session قبلی ═══════════
-      - name: Restore data from previous session
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\Persistent
-          key: rdp-data-${{ github.run_id }}
-          restore-keys: |
-            rdp-data-
-
-      - name: Put files back where they were
+      - name: 1. Enable Remote Desktop & Firewall
+        shell: powershell
         run: |
-          if (Test-Path "C:\Persistent\Desktop") {
-            Copy-Item "C:\Persistent\Desktop\*" "$env:USERPROFILE\Desktop\" -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          if (Test-Path "C:\Persistent\Downloads") {
-            Copy-Item "C:\Persistent\Downloads\*" "$env:USERPROFILE\Downloads\" -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          if (Test-Path "C:\Persistent\Documents") {
-            Copy-Item "C:\Persistent\Documents\*" "$env:USERPROFILE\Documents\" -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          Write-Host ">>> Restore complete."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 0
 
-      # ═══════════ 2. RDP + ادمین ═══════════
-      - name: Enable RDP
+      - name: 2. Create Admin Account
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0
-
-      - name: Create admin account
-        run: |
-          $p = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $p -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember Administrators CynetAdmin -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
-
-      # ═══════════ 3. نصب برنامه‌ها (پایه + برنامه‌های session قبل) ═══════════
-      - name: Reinstall apps
-        run: |
-          choco install googlechrome -y --no-progress
-          if (Test-Path "C:\Persistent\apps.txt") {
-            Get-Content "C:\Persistent\apps.txt" | Where-Object { $_ -and $_ -notmatch 'chocolatey|^$' } | ForEach-Object {
-              $app = ($_ -split '\s+')[0]
-              choco install $app -y --no-progress 2>$null
-            }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'Add RDP_PASSWORD to GitHub Actions secrets before running this workflow.'
           }
 
-      # ═══════════ 4. Tailscale ═══════════
-      - name: Connect Tailscale
+          $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name 'CynetAdmin' -Password $Password `
+            -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Administrators' -Member 'CynetAdmin' `
+            -ErrorAction SilentlyContinue
+
+      - name: 3. Install & Connect Tailscale VPN
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\ts.msi"
-          Start-Process msiexec -ArgumentList "/i C:\ts.msi /quiet /norestart" -Wait
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          $ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          Write-Host ""
-          Write-Host "=============================================" -ForegroundColor Green
-          Write-Host "  RDP READY  |  Tailscale IP: $ip" -ForegroundColor Yellow
-          Write-Host "  User: CynetAdmin  Pass: Cynet@2026" -ForegroundColor Yellow
-          Write-Host "=============================================" -ForegroundColor Green
-
-      # ═══════════ 5. زنده نگه داشتن + سینک داخلی هر ۵ دقیقه ═══════════
-      - name: Keep alive + sync to Persistent
-        run: |
-          $deadline = (Get-Date).AddMinutes(325)
-          while ((Get-Date) -lt $deadline) {
-            robocopy "$env:USERPROFILE\Desktop"   "C:\Persistent\Desktop"   /E /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
-            robocopy "$env:USERPROFILE\Downloads" "C:\Persistent\Downloads" /E /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
-            robocopy "$env:USERPROFILE\Documents" "C:\Persistent\Documents" /E /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
-            choco list --local-only 2>$null | Out-File "C:\Persistent\apps.txt"
-            Start-Sleep -Seconds 300
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw 'Add TAILSCALE_AUTHKEY to GitHub Actions secrets before running this workflow.'
           }
-          Write-Host ">>> Time's up — preparing to save."
 
-      # ═══════════ 6. ذخیره نهایی (مهم‌ترین مرحله) ═══════════
-      - name: Save data to cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\Persistent
-          key: rdp-data-${{ github.run_id }}
+          $installer = 'C:\tailscale.msi'
+          Invoke-WebRequest `
+            'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+            -OutFile $installer
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
 
-      # ═══════════ 7. راه‌اندازی session بعدی (زنجیره بی‌نهایت) ═══════════
-      - name: Launch next session
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.RELAUNCH_TOKEN }}
-        shell: pwsh
+          Start-Sleep -Seconds 5
+          & 'C:\Program Files\Tailscale\tailscale.exe' up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname='windows-persistent-rdp'
+
+          Start-Sleep -Seconds 8
+          $ts_ip = (& 'C:\Program Files\Tailscale\tailscale.exe' ip -4).Trim()
+
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host '  >>> RDP SERVER IS READY! <<<' -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host '  Username     : CynetAdmin' -ForegroundColor Yellow
+          Write-Host '  Password     : use the RDP_PASSWORD secret' -ForegroundColor Yellow
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host '==================================================' -ForegroundColor Green
+
+      - name: 4. Schedule a restart after 6 hours
+        shell: powershell
         run: |
-          $headers = @{ Authorization = "Bearer $Env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-          Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp.yml/dispatches" `
-            -Method Post -Headers $headers -Body '{"ref":"main"}'
-          Write-Host ">>> Next session triggered — chain continues."
+          # This only restarts Windows. It does not delete files.
+          # Files saved on the VPS persistent disk (for example C:\RDPData)
+          # remain available after the restart.
+          $taskName = 'Restart-Windows-VPS-after-6-hours'
+          $restartAt = (Get-Date).AddHours(6)
+
+          $action = New-ScheduledTaskAction `
+            -Execute "$env:SystemRoot\System32\shutdown.exe" `
+            -Argument '/r /f /t 60 /d p:0:0 /c "Scheduled restart after 6 hours"'
+          $trigger = New-ScheduledTaskTrigger -Once -At $restartAt
+
+          Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Trigger $trigger `
+            -User 'SYSTEM' `
+            -RunLevel Highest `
+            -Force
+
+          Write-Host "Windows restart scheduled for $restartAt"
+
+      - name: 5. Keep workflow alive until the restart window
+        shell: powershell
+        run: |
+          # The restart task is independent of this loop. No cleanup is run.
+          $end = (Get-Date).AddHours(6)
+          while ((Get-Date) -lt $end) {
+            $remaining = $end - (Get-Date)
+            Write-Host ("VPS running. Remaining: {0:hh\:mm\:ss}" -f $remaining)
+            Start-Sleep -Seconds 60
+          }
