@@ -9,127 +9,147 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: 1. Enable Remote Desktop
+
+      # =========================================
+      # 1. Restore previous files
+      # =========================================
+      - name: Restore Previous Files
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: windows-persistent-files
+          path: C:\PersistentFiles
+
+      # =========================================
+      # 2. Enable RDP
+      # =========================================
+      - name: Enable Remote Desktop & Firewall
         shell: powershell
         run: |
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
+            -Name "fDenyTSConnections" `
             -Value 0
 
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
+            -Name "UserAuthentication" `
             -Value 0
 
-      - name: 2. Create RDP User
+      # =========================================
+      # 3. Create Admin Account
+      # =========================================
+      - name: Create Admin Account
         shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD || vars.RDP_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "RDP_PASSWORD not found. Add it under Repository secrets or Repository variables."
-          }
+          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
 
-          $SecurePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
-
-          $ExistingUser = Get-LocalUser `
-            -Name 'CynetAdmin' `
+          New-LocalUser `
+            -Name "CynetAdmin" `
+            -Password $Password `
+            -PasswordNeverExpires `
             -ErrorAction SilentlyContinue
-
-          if ($null -eq $ExistingUser) {
-            New-LocalUser `
-              -Name 'CynetAdmin' `
-              -Password $SecurePassword `
-              -PasswordNeverExpires `
-              -AccountNeverExpires
-          } else {
-            Set-LocalUser `
-              -Name 'CynetAdmin' `
-              -Password $SecurePassword
-          }
 
           Add-LocalGroupMember `
-            -Group 'Administrators' `
-            -Member 'CynetAdmin' `
+            -Group "Administrators" `
+            -Member "CynetAdmin" `
             -ErrorAction SilentlyContinue
 
-          Write-Host 'RDP user created successfully.'
-
-      - name: 3. Install Tailscale
+      # =========================================
+      # 4. Install Tailscale
+      # =========================================
+      - name: Install & Connect Tailscale
         shell: powershell
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY || vars.TAILSCALE_AUTHKEY }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "TAILSCALE_AUTHKEY not found. Add it under Repository secrets or Repository variables."
-          }
-
-          $Installer = 'C:\tailscale.msi'
-
           Invoke-WebRequest `
-            -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
-            -OutFile $Installer
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "C:\tailscale.msi"
 
           Start-Process `
-            -FilePath 'msiexec.exe' `
-            -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+            msiexec.exe `
+            -ArgumentList "/i C:\tailscale.msi /quiet /norestart" `
             -Wait
+
+          Start-Sleep -Seconds 5
+
+          & "C:\Program Files\Tailscale\tailscale.exe" up `
+            --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --hostname="github-rdp-server"
 
           Start-Sleep -Seconds 8
 
-          $Tailscale = 'C:\Program Files\Tailscale\tailscale.exe'
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
 
-          & $Tailscale up `
-            --authkey="$env:TAILSCALE_AUTHKEY" `
-            --hostname='github-rdp-server'
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "        RDP SERVER IS READY"
+          Write-Host "============================================"
+          Write-Host "Tailscale IP : $ts_ip"
+          Write-Host "Username     : CynetAdmin"
+          Write-Host "Password     : Cynet@2026"
+          Write-Host "============================================"
 
-          Start-Sleep -Seconds 10
-
-          $TS_IP = (& $Tailscale ip -4).Trim()
-
-          Write-Host ''
-          Write-Host '============================================' -ForegroundColor Green
-          Write-Host '          RDP SERVER IS READY' -ForegroundColor Cyan
-          Write-Host '============================================' -ForegroundColor Green
-          Write-Host "Tailscale IP : $TS_IP" -ForegroundColor Yellow
-          Write-Host 'Username     : CynetAdmin' -ForegroundColor Yellow
-          Write-Host 'Password     : value saved in RDP_PASSWORD' -ForegroundColor Yellow
-          Write-Host '============================================' -ForegroundColor Green
-
-      - name: 4. Schedule Restart After 6 Hours
+      # =========================================
+      # 5. Keep RDP alive
+      # =========================================
+      - name: Keep Server Alive
         shell: powershell
         run: |
-          $TaskName = 'Restart-RDP-After-6-Hours'
-          $RestartTime = (Get-Date).AddHours(6)
-
-          $Action = New-ScheduledTaskAction `
-            -Execute "$env:SystemRoot\System32\shutdown.exe" `
-            -Argument '/r /f /t 60 /d p:0:0 /c "Scheduled restart after 6 hours"'
-
-          $Trigger = New-ScheduledTaskTrigger `
-            -Once `
-            -At $RestartTime
-
-          Register-ScheduledTask `
-            -TaskName $TaskName `
-            -Action $Action `
-            -Trigger $Trigger `
-            -User 'SYSTEM' `
-            -RunLevel Highest `
-            -Force
-
-          Write-Host "Restart scheduled for $RestartTime"
-
-      - name: 5. Keep RDP Alive
-        shell: powershell
-        run: |
-          for ($i = 1; $i -le 360; $i++) {
+          for ($i = 1; $i -le 350; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/360] RDP server is running..."
+            Write-Host "[$i/350] Server running..."
           }
+
+      # =========================================
+      # 6. Save Desktop files
+      # =========================================
+      - name: Save Persistent Files
+        shell: powershell
+        run: |
+          $SavePath = "C:\PersistentFiles"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $SavePath `
+            -Force | Out-Null
+
+          $Desktop = "C:\Users\runneradmin\Desktop"
+
+          if (Test-Path $Desktop) {
+            Copy-Item `
+              "$Desktop\*" `
+              "$SavePath\" `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Persistent files saved."
+
+      # =========================================
+      # 7. Upload Artifact
+      # =========================================
+      - name: Upload Persistent Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-persistent-files
+          path: C:\PersistentFiles
+          retention-days: 90
+          compression-level: 6
+          if-no-files-found: warn
+
+      # =========================================
+      # 8. Finish
+      # =========================================
+      - name: Done
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "Files uploaded to GitHub Artifact."
+          Write-Host "Artifact: windows-persistent-files"
+          Write-Host "============================================"
