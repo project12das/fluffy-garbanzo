@@ -15,7 +15,7 @@ jobs:
     steps:
 
       # =========================================
-      # 1. Restore Previous Files
+      # 1. Download Previous Run Artifact
       # =========================================
 
       - name: Restore Previous Files
@@ -24,40 +24,12 @@ jobs:
         with:
           name: windows-persistent-files
           path: C:\PersistentFiles
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
 
       # =========================================
-      # 2. Restore User Data
-      # =========================================
-
-      - name: Restore User Data
-        shell: powershell
-        run: |
-          $Source = "C:\PersistentFiles\Profile"
-          $Destination = "C:\Users\runneradmin"
-
-          $Folders = @(
-            "Desktop",
-            "Documents",
-            "Downloads"
-          )
-
-          foreach ($Folder in $Folders) {
-            $From = Join-Path $Source $Folder
-            $To = Join-Path $Destination $Folder
-
-            New-Item -ItemType Directory -Path $To -Force |
-              Out-Null
-
-            if (Test-Path $From) {
-              Copy-Item "$From\*" $To -Recurse -Force `
-                -ErrorAction SilentlyContinue
-            }
-          }
-
-          Write-Host "Previous files restored."
-
-      # =========================================
-      # 3. Enable RDP
+      # 2. Enable RDP
       # =========================================
 
       - name: Enable Remote Desktop
@@ -76,7 +48,7 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # =========================================
-      # 4. Create Admin Account
+      # 3. Create Admin Account
       # =========================================
 
       - name: Create Admin Account
@@ -85,7 +57,7 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Set RDP_PASSWORD in GitHub Secrets."
+            throw "RDP_PASSWORD secret is missing."
           }
 
           $Password = ConvertTo-SecureString `
@@ -106,36 +78,7 @@ jobs:
             -ErrorAction SilentlyContinue
 
       # =========================================
-      # 5. Restore Applications
-      # =========================================
-
-      - name: Restore Applications
-        shell: powershell
-        continue-on-error: true
-        run: |
-          $Manifest = "C:\PersistentFiles\packages.json"
-
-          if (Test-Path $Manifest) {
-
-            if (Get-Command winget -ErrorAction SilentlyContinue) {
-
-              winget import `
-                --import-file $Manifest `
-                --ignore-unavailable `
-                --accept-package-agreements `
-                --accept-source-agreements `
-                --disable-interactivity
-
-            } else {
-              Write-Host "WinGet is not available."
-            }
-
-          } else {
-            Write-Host "No previous application manifest."
-          }
-
-      # =========================================
-      # 6. Install Tailscale
+      # 4. Install Tailscale
       # =========================================
 
       - name: Install Tailscale
@@ -144,7 +87,7 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "Set TAILSCALE_AUTHKEY in GitHub Secrets."
+            throw "TAILSCALE_AUTHKEY secret is missing."
           }
 
           Invoke-WebRequest `
@@ -155,21 +98,21 @@ jobs:
             -ArgumentList "/i C:\tailscale.msi /quiet /norestart" `
             -Wait
 
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 8
 
           & "C:\Program Files\Tailscale\tailscale.exe" up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname="github-rdp-server"
 
-          Start-Sleep -Seconds 8
+          Start-Sleep -Seconds 5
 
           $IP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
 
-          Write-Host "Tailscale IP: $IP"
+          Write-Host "RDP IP: $IP"
           Write-Host "Username: CynetAdmin"
 
       # =========================================
-      # 7. Keep Server Alive
+      # 5. Keep Runner Alive
       # =========================================
 
       - name: Keep Server Alive
@@ -181,13 +124,15 @@ jobs:
           }
 
       # =========================================
-      # 8. Prepare Backup
+      # 6. Prepare Backup
       # =========================================
 
       - name: Prepare Backup
         if: always()
         shell: powershell
         run: |
+          $ErrorActionPreference = "Continue"
+
           $SavePath = "C:\PersistentFiles"
           $Profile = "$SavePath\Profile"
 
@@ -218,13 +163,30 @@ jobs:
             }
           }
 
-          # Export application list
-          if (Get-Command winget -ErrorAction SilentlyContinue) {
+          # WinGet export - noninteractive
 
-            winget export `
-              --output "$SavePath\packages.json" `
-              --include-versions
+          try {
 
+            $Winget = Get-Command winget.exe `
+              -ErrorAction SilentlyContinue
+
+            if ($Winget) {
+
+              $env:WINGET_DISABLE_INTERACTIVITY = "1"
+
+              & winget export `
+                --output "$SavePath\packages.json" `
+                --include-versions `
+                --accept-source-agreements `
+                --disable-interactivity
+
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "WinGet export failed."
+              }
+            }
+
+          } catch {
+            Write-Warning "WinGet error: $_"
           }
 
           if (-not (Test-Path "$SavePath\packages.json")) {
@@ -242,7 +204,7 @@ jobs:
           Write-Host "Backup prepared."
 
       # =========================================
-      # 9. Upload Artifact
+      # 7. Upload Artifact
       # =========================================
 
       - name: Upload Persistent Files
@@ -253,5 +215,17 @@ jobs:
           path: C:\PersistentFiles
           retention-days: 90
           compression-level: 6
-          if-no-files-found: warn
           overwrite: true
+          if-no-files-found: warn
+
+      # =========================================
+      # 8. Finish
+      # =========================================
+
+      - name: Done
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "================================"
+          Write-Host "WINDOWS BACKUP FINISHED"
+          Write-Host "================================"
