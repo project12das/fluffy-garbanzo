@@ -6,6 +6,7 @@ on:
 
 permissions:
   actions: read
+  contents: read
 
 jobs:
   build:
@@ -15,21 +16,86 @@ jobs:
     steps:
 
       # =========================================
-      # 1. Download Previous Run Artifact
+      # 1. Find Previous Successful Run
+      # =========================================
+
+      - name: Find Previous Successful Backup
+        id: previous
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "windows-cloud-rdp.yml",
+              status: "completed",
+              per_page: 30
+            });
+
+            const previous = runs.data.workflow_runs.find(
+              run => run.id !== context.runId &&
+                     run.conclusion === "success"
+            );
+
+            if (!previous) {
+              core.info("No previous successful run found.");
+              core.setOutput("run_id", "");
+              return;
+            }
+
+            core.info(`Previous run: ${previous.id}`);
+            core.setOutput("run_id", String(previous.id));
+
+      # =========================================
+      # 2. Restore Previous Artifact
       # =========================================
 
       - name: Restore Previous Files
+        if: steps.previous.outputs.run_id != ''
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: windows-persistent-files
           path: C:\PersistentFiles
           github-token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          run-id: ${{ github.run_id }}
+          run-id: ${{ steps.previous.outputs.run_id }}
 
       # =========================================
-      # 2. Enable RDP
+      # 3. Restore User Files
+      # =========================================
+
+      - name: Restore User Files
+        shell: powershell
+        run: |
+          $Source = "C:\PersistentFiles\Profile"
+          $Destination = "C:\Users\runneradmin"
+
+          $Folders = @(
+            "Desktop",
+            "Documents",
+            "Downloads"
+          )
+
+          foreach ($Folder in $Folders) {
+
+            $From = Join-Path $Source $Folder
+            $To = Join-Path $Destination $Folder
+
+            New-Item -ItemType Directory `
+              -Path $To -Force | Out-Null
+
+            if (Test-Path $From) {
+              Copy-Item "$From\*" `
+                -Destination $To `
+                -Recurse -Force `
+                -ErrorAction Continue
+            }
+          }
+
+          Write-Host "Previous files restored."
+
+      # =========================================
+      # 4. Enable RDP
       # =========================================
 
       - name: Enable Remote Desktop
@@ -48,7 +114,7 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # =========================================
-      # 3. Create Admin Account
+      # 5. Create Admin Account
       # =========================================
 
       - name: Create Admin Account
@@ -78,7 +144,42 @@ jobs:
             -ErrorAction SilentlyContinue
 
       # =========================================
-      # 4. Install Tailscale
+      # 6. Restore Applications
+      # =========================================
+
+      - name: Restore Applications
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $Manifest = "C:\PersistentFiles\packages.json"
+
+          if (Test-Path $Manifest) {
+
+            if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+
+              $env:WINGET_DISABLE_INTERACTIVITY = "1"
+
+              winget import `
+                --import-file $Manifest `
+                --ignore-unavailable `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity
+
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Some applications could not be restored."
+              }
+
+            } else {
+              Write-Host "WinGet is unavailable."
+            }
+
+          } else {
+            Write-Host "No application manifest found."
+          }
+
+      # =========================================
+      # 7. Install Tailscale
       # =========================================
 
       - name: Install Tailscale
@@ -108,11 +209,13 @@ jobs:
 
           $IP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
 
+          Write-Host "================================"
           Write-Host "RDP IP: $IP"
           Write-Host "Username: CynetAdmin"
+          Write-Host "================================"
 
       # =========================================
-      # 5. Keep Runner Alive
+      # 8. Keep Runner Alive
       # =========================================
 
       - name: Keep Server Alive
@@ -124,7 +227,7 @@ jobs:
           }
 
       # =========================================
-      # 6. Prepare Backup
+      # 9. Prepare Backup
       # =========================================
 
       - name: Prepare Backup
@@ -163,30 +266,26 @@ jobs:
             }
           }
 
-          # WinGet export - noninteractive
-
+          # Export installed applications
           try {
 
-            $Winget = Get-Command winget.exe `
-              -ErrorAction SilentlyContinue
-
-            if ($Winget) {
+            if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
 
               $env:WINGET_DISABLE_INTERACTIVITY = "1"
 
-              & winget export `
+              winget export `
                 --output "$SavePath\packages.json" `
                 --include-versions `
                 --accept-source-agreements `
                 --disable-interactivity
 
               if ($LASTEXITCODE -ne 0) {
-                Write-Warning "WinGet export failed."
+                Write-Warning "Winget export failed."
               }
             }
 
           } catch {
-            Write-Warning "WinGet error: $_"
+            Write-Warning "Winget error: $_"
           }
 
           if (-not (Test-Path "$SavePath\packages.json")) {
@@ -204,7 +303,7 @@ jobs:
           Write-Host "Backup prepared."
 
       # =========================================
-      # 7. Upload Artifact
+      # 10. Upload New Artifact
       # =========================================
 
       - name: Upload Persistent Files
@@ -219,7 +318,7 @@ jobs:
           if-no-files-found: warn
 
       # =========================================
-      # 8. Finish
+      # 11. Finish
       # =========================================
 
       - name: Done
@@ -227,5 +326,5 @@ jobs:
         shell: powershell
         run: |
           Write-Host "================================"
-          Write-Host "WINDOWS BACKUP FINISHED"
+          Write-Host "WINDOWS BACKUP SYSTEM FINISHED"
           Write-Host "================================"
