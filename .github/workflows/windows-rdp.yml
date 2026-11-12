@@ -1,18 +1,23 @@
+
 name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
 
+permissions:
+  actions: read
+
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
 
       # =========================================
-      # 1. Restore previous files
+      # 1. Restore Previous Files
       # =========================================
+
       - name: Restore Previous Files
         uses: actions/download-artifact@v4
         continue-on-error: true
@@ -21,9 +26,41 @@ jobs:
           path: C:\PersistentFiles
 
       # =========================================
-      # 2. Enable RDP
+      # 2. Restore User Data
       # =========================================
-      - name: Enable Remote Desktop & Firewall
+
+      - name: Restore User Data
+        shell: powershell
+        run: |
+          $Source = "C:\PersistentFiles\Profile"
+          $Destination = "C:\Users\runneradmin"
+
+          $Folders = @(
+            "Desktop",
+            "Documents",
+            "Downloads"
+          )
+
+          foreach ($Folder in $Folders) {
+            $From = Join-Path $Source $Folder
+            $To = Join-Path $Destination $Folder
+
+            New-Item -ItemType Directory -Path $To -Force |
+              Out-Null
+
+            if (Test-Path $From) {
+              Copy-Item "$From\*" $To -Recurse -Force `
+                -ErrorAction SilentlyContinue
+            }
+          }
+
+          Write-Host "Previous files restored."
+
+      # =========================================
+      # 3. Enable RDP
+      # =========================================
+
+      - name: Enable Remote Desktop
         shell: powershell
         run: |
           Set-ItemProperty `
@@ -31,26 +68,37 @@ jobs:
             -Name "fDenyTSConnections" `
             -Value 0
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" `
-            -Value 0
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       # =========================================
-      # 3. Create Admin Account
+      # 4. Create Admin Account
       # =========================================
+
       - name: Create Admin Account
         shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Set RDP_PASSWORD in GitHub Secrets."
+          }
 
-          New-LocalUser `
-            -Name "CynetAdmin" `
-            -Password $Password `
-            -PasswordNeverExpires `
-            -ErrorAction SilentlyContinue
+          $Password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "CynetAdmin" `
+            -ErrorAction SilentlyContinue)) {
+
+            New-LocalUser `
+              -Name "CynetAdmin" `
+              -Password $Password `
+              -PasswordNeverExpires
+          }
 
           Add-LocalGroupMember `
             -Group "Administrators" `
@@ -58,82 +106,147 @@ jobs:
             -ErrorAction SilentlyContinue
 
       # =========================================
-      # 4. Install Tailscale
+      # 5. Restore Applications
       # =========================================
-      - name: Install & Connect Tailscale
+
+      - name: Restore Applications
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $Manifest = "C:\PersistentFiles\packages.json"
+
+          if (Test-Path $Manifest) {
+
+            if (Get-Command winget -ErrorAction SilentlyContinue) {
+
+              winget import `
+                --import-file $Manifest `
+                --ignore-unavailable `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity
+
+            } else {
+              Write-Host "WinGet is not available."
+            }
+
+          } else {
+            Write-Host "No previous application manifest."
+          }
+
+      # =========================================
+      # 6. Install Tailscale
+      # =========================================
+
+      - name: Install Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "Set TAILSCALE_AUTHKEY in GitHub Secrets."
+          }
+
           Invoke-WebRequest `
             "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
             -OutFile "C:\tailscale.msi"
 
-          Start-Process `
-            msiexec.exe `
+          Start-Process msiexec.exe `
             -ArgumentList "/i C:\tailscale.msi /quiet /norestart" `
             -Wait
 
           Start-Sleep -Seconds 5
 
           & "C:\Program Files\Tailscale\tailscale.exe" up `
-            --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname="github-rdp-server"
 
           Start-Sleep -Seconds 8
 
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          $IP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
 
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "        RDP SERVER IS READY"
-          Write-Host "============================================"
-          Write-Host "Tailscale IP : $ts_ip"
-          Write-Host "Username     : CynetAdmin"
-          Write-Host "Password     : Cynet@2026"
-          Write-Host "============================================"
+          Write-Host "Tailscale IP: $IP"
+          Write-Host "Username: CynetAdmin"
 
       # =========================================
-      # 5. Keep RDP alive
+      # 7. Keep Server Alive
       # =========================================
+
       - name: Keep Server Alive
         shell: powershell
         run: |
-          for ($i = 1; $i -le 350; $i++) {
+          for ($i = 1; $i -le 330; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/350] Server running..."
+            Write-Host "[$i/330] Server running..."
           }
 
       # =========================================
-      # 6. Save Desktop files
+      # 8. Prepare Backup
       # =========================================
-      - name: Save Persistent Files
+
+      - name: Prepare Backup
+        if: always()
         shell: powershell
         run: |
           $SavePath = "C:\PersistentFiles"
+          $Profile = "$SavePath\Profile"
 
-          New-Item `
-            -ItemType Directory `
-            -Path $SavePath `
-            -Force | Out-Null
+          New-Item -ItemType Directory `
+            -Path $Profile -Force | Out-Null
 
-          $Desktop = "C:\Users\runneradmin\Desktop"
+          $Folders = @(
+            "Desktop",
+            "Documents",
+            "Downloads"
+          )
 
-          if (Test-Path $Desktop) {
-            Copy-Item `
-              "$Desktop\*" `
-              "$SavePath\" `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
+          foreach ($Folder in $Folders) {
+
+            $Source = "C:\Users\runneradmin\$Folder"
+            $Target = "$Profile\$Folder"
+
+            New-Item -ItemType Directory `
+              -Path $Target -Force | Out-Null
+
+            if (Test-Path $Source) {
+
+              robocopy $Source $Target /E /R:1 /W:1 /NFL /NDL /NJH /NJS
+
+              if ($LASTEXITCODE -ge 8) {
+                Write-Warning "Copy issue in $Folder"
+              }
+            }
           }
 
-          Write-Host "Persistent files saved."
+          # Export application list
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+
+            winget export `
+              --output "$SavePath\packages.json" `
+              --include-versions
+
+          }
+
+          if (-not (Test-Path "$SavePath\packages.json")) {
+            '{"Sources":[]}' |
+              Set-Content "$SavePath\packages.json"
+          }
+
+          @{
+            SavedAt = (Get-Date).ToUniversalTime().ToString("o")
+            Machine = "Windows GitHub Runner"
+            Folders = $Folders
+          } | ConvertTo-Json -Depth 5 |
+            Set-Content "$SavePath\backup-info.json"
+
+          Write-Host "Backup prepared."
 
       # =========================================
-      # 7. Upload Artifact
+      # 9. Upload Artifact
       # =========================================
+
       - name: Upload Persistent Files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-persistent-files
@@ -141,15 +254,4 @@ jobs:
           retention-days: 90
           compression-level: 6
           if-no-files-found: warn
-
-      # =========================================
-      # 8. Finish
-      # =========================================
-      - name: Done
-        shell: powershell
-        run: |
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "Files uploaded to GitHub Artifact."
-          Write-Host "Artifact: windows-persistent-files"
-          Write-Host "============================================"
+          overwrite: true
